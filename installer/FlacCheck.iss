@@ -12,7 +12,7 @@
 ; Bei neuen Versionen AppId beibehalten (sonst gilt es als anderes Programm), nur AppVersion anheben.
 
 #define AppName "FlacCheck"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppPublisher "yakobo1970"
 #define AppURL "https://www.undabtanzbar.de/software/flaccheck/"
 #define AppExeName "FlacCheck.exe"

@@ -27,6 +27,7 @@ from .theme import KIND_COLORS
 from .track_view import fmt_time
 
 BIN = 512  # Samples je Wellenform-Bin
+MAX_LISTED_PARTS = 12  # so viele Teilstuecke nennt die Speichern-Abfrage hoechstens einzeln
 
 
 class _PeakLoader(QThread):
@@ -603,7 +604,12 @@ class EditorWindow(QWidget):
         keep = self.chk_keep.isChecked()
         src = os.path.abspath(self.src)
         old_name = self._defect_path(src, dsts)
-        msg = "\n".join(f"Teil {i}: {os.path.basename(d)}  ({editing.part_duration(r):.1f} s)" for i, r, d, _ in jobs)
+        lines = [f"Teil {i}: {os.path.basename(d)}  ({editing.part_duration(r):.1f} s)" for i, r, d, _ in jobs]
+        if len(lines) > MAX_LISTED_PARTS:
+            # Sonst wird die Abfrage hoeher als der Bildschirm und der Ja-Knopf ist nicht erreichbar
+            lines = (lines[:MAX_LISTED_PARTS - 2] + [f"… {len(lines) - MAX_LISTED_PARTS + 1} weitere Teile …"]
+                     + lines[-1:])
+        msg = f"Zielordner: {self.folder}\n\n" + "\n".join(lines)
         where = "bleibt im Originalordner" if keep else "wandert in den Windows-Papierkorb"
         msg += f"\n\nDas Original wird in »{os.path.basename(old_name)}« umbenannt und {where}."
         if QMessageBox.question(self, self._save_label(len(jobs)), msg + "\n\nSpeichern?") != QMessageBox.Yes:
