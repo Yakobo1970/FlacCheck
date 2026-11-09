@@ -12,7 +12,7 @@ untereinander als Wellenform. Jede Fundstelle bekommt einen Marker
 
 ## Installation (Windows)
 
-Den Installer **`FlacCheck-1.0.0-Setup.exe`** unter
+Den aktuellen Installer **`FlacCheck-<Version>-Setup.exe`** unter
 [Releases](https://github.com/Yakobo1970/FlacCheck/releases) herunterladen und starten. Er installiert
 pro Benutzer (keine Admin-Rechte nötig) und bringt alles mit – Python, Qt, FFmpeg, libsndfile und
 PortAudio müssen nicht separat installiert werden. Die Datenbank liegt in `%LOCALAPPDATA%\FlacCheck`
