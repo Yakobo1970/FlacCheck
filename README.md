@@ -89,6 +89,9 @@ in die Sonderliste“ stehen sie danach samt Wellenform in der Sonderliste zum A
 nächste Scan ihres neuen Ordners sie an Dateiname, Spieldauer und Abtastrate wieder und übernimmt
 Analyse und Prüfstand – ohne Neuanalyse. Einträge ohne neuen Fundort gelten als „fehlend“ und
 werden ausgeblendet; „Datei → Fehlende Dateien prüfen …“ kann sie entfernen.
+Ausnahme: Eine als defekt bestätigte Datei, die unter gleichem Namen mit anderer Dateigröße an
+einem anderen Ort auftaucht (z. B. neu eingelesen), erbt den Defekt nicht und wird frisch analysiert.
+Ersetzte Dateien am selben Ort werden ohnehin neu analysiert, ihr Prüfstand wird dabei zurückgesetzt.
 
 **Drag & Drop:** Dateien oder Ordner einfach ins Fenster ziehen – sie werden sofort analysiert
 und erscheinen bei ihren Scanquellen.
@@ -178,6 +181,7 @@ python tests/make_test_files.py <Ordner>   # synthetische Fehlerdateien erzeugen
 python tests/run_engine.py <Ordner>        # Analyse ohne GUI
 python tests/gui_smoke.py <Ordner> shot.png <test.db>
 python tests/gui_actions.py <test.db> <Arbeitsordner>
+python tests/replaced_defects.py <Arbeitsordner> <flac> <mp3>   # ersetzte Defekt-Dateien
 python tests/player_ranges.py <Audiodatei>       # Editor-Vorschau überspringt entfernte Bereiche
 ```
 

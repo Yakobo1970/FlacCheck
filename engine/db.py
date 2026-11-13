@@ -415,11 +415,23 @@ class Database:
             self.conn.executemany("UPDATE files SET status='missing' WHERE id=?", [(i,) for i in ids])
             self.conn.commit()
 
-    def relocate(self, file_id: int, new_path: str, size: int, mtime: float):
+    def relocate(self, file_id: int, new_path: str, size: int, mtime: float) -> bool:
         """Verschobene Datei: Eintrag samt Pruefstand an den neuen Ort umziehen. Der Status wird
-        aus den Markern wiederhergestellt, eine Neuanalyse ist nicht noetig (Ton unveraendert)."""
+        aus den Markern wiederhergestellt, eine Neuanalyse ist nicht noetig (Ton unveraendert).
+        Ausnahme: Eine als defekt bestaetigte Datei, deren Groesse sich geaendert hat, ist meist ein
+        neu eingelesener Ersatz -- sie erbt den Defekt nicht, sondern wird frisch analysiert.
+        Rueckgabe True = Eintrag zur Neuanalyse zurueckgesetzt."""
         with self.lock:
+            old_size, defect = self.conn.execute("SELECT size, defect FROM files WHERE id=?",
+                                                 (file_id,)).fetchone()
             self.conn.execute("DELETE FROM files WHERE path=? AND id<>?", (new_path, file_id))
+            if defect and old_size != size:
+                self.conn.execute("DELETE FROM markers WHERE file_id=?", (file_id,))
+                self.conn.execute(
+                    "UPDATE files SET path=?, size=?, mtime=?, status='pending', defect=0, reviewed=0, "
+                    "peaks=NULL, error='', reviewed_at=? WHERE id=?", (new_path, size, mtime, _now(), file_id))
+                self.conn.commit()
+                return True
             has_markers = self.conn.execute("SELECT COUNT(*) FROM markers WHERE file_id=?",
                                             (file_id,)).fetchone()[0]
             err = self.conn.execute("SELECT error FROM files WHERE id=?", (file_id,)).fetchone()[0]
@@ -427,6 +439,7 @@ class Database:
             self.conn.execute("UPDATE files SET path=?, size=?, mtime=?, status=? WHERE id=?",
                               (new_path, size, mtime, status, file_id))
             self.conn.commit()
+        return False
 
     def delete_missing(self) -> int:
         with self.lock:
