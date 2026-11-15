@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -89,6 +90,24 @@ class FileRow:
     has_peaks: bool = False
     reviewed_at: str = ""          # Zeitpunkt der letzten Pruefaktion (ISO), "" = unbekannt
     parked: bool = False           # in der Sonderliste geparkt (z. B. zum Bearbeiten)
+    moved_to: str = ""             # wohin die defekte Datei verschoben wurde (Log), "" = unbekannt
+    replaced: bool = False         # am Ursprungsort liegt ein Ersatz, den der Nutzer noch pruefen muss
+
+    @property
+    def missing(self) -> bool:
+        """Datei am (Ursprungs-)Ort nicht mehr vorhanden."""
+        return self.status == "missing"
+
+    @property
+    def moved_note(self) -> str:
+        """Wo die defekte Datei geblieben ist, als Satz (leer, wenn unbekannt)."""
+        if not self.moved_to:
+            return ""
+        if self.moved_to == "(Papierkorb)":
+            return "Die defekte Datei liegt im Papierkorb."
+        if self.moved_to.startswith("("):
+            return "Die defekte Datei wurde endgültig gelöscht."
+        return f"Die defekte Datei liegt jetzt in {os.path.dirname(self.moved_to)}."
 
     @property
     def removed_markers(self) -> list[MarkerRow]:
@@ -120,6 +139,11 @@ class FileRow:
 
 def _now() -> str:
     return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _under_any(path: str, roots: list[str]) -> bool:
+    p = os.path.normcase(os.path.normpath(path))
+    return any(p.startswith(os.path.normcase(os.path.normpath(r)).rstrip("\\/") + os.sep) for r in roots)
 
 
 def infer_scan_roots(paths: list[str], last_root: str | None = None) -> list[str]:
@@ -194,11 +218,64 @@ class Database:
             self.conn.execute("ALTER TABLE files ADD COLUMN reviewed_at TEXT")
         if "parked" not in fcols:
             self.conn.execute("ALTER TABLE files ADD COLUMN parked INTEGER NOT NULL DEFAULT 0")
+        if "moved_to" not in fcols:   # wohin die defekte Datei verschoben wurde ("" = unbekannt)
+            self.conn.execute("ALTER TABLE files ADD COLUMN moved_to TEXT")
+        if "replaced" not in fcols:   # Datei am Ursprungsort ist ein Ersatz, Pruefung durch den Nutzer offen
+            self.conn.execute("ALTER TABLE files ADD COLUMN replaced INTEGER NOT NULL DEFAULT 0")
+        if self.conn.execute("SELECT value FROM settings WHERE key='defects_at_origin'").fetchone() is None:
+            self._defects_back_to_origin()
+            self.conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('defects_at_origin', 'true')")
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(markers)")}
         if "level" not in cols:
             self.conn.execute("ALTER TABLE markers ADD COLUMN level INTEGER NOT NULL DEFAULT 1")
         if "kind_levels" not in cols:
             self.conn.execute("ALTER TABLE markers ADD COLUMN kind_levels TEXT")
+
+    def _origin_of(self, path: str) -> str | None:
+        """Urspruenglicher Ort einer mit Ordnerstruktur verschobenen Datei: Taucht der Name einer
+        Scanquelle im Pfad auf, gehoert der Rest dahinter unter diese Quelle
+        (Desktop\\DEFEKT\\Alben (FLAC)\\A\\x.flac -> D:\\...\\Alben (FLAC)\\A\\x.flac)."""
+        parts = os.path.normpath(path).split(os.sep)
+        for root in self.scan_roots():
+            name = os.path.basename(root.rstrip("\\/"))
+            low = [p.lower() for p in parts]
+            if name and name.lower() in low[:-1]:
+                i = len(low) - 1 - low[::-1].index(name.lower())
+                origin = os.path.join(root, *parts[i + 1:])
+                if os.path.normcase(origin) != os.path.normcase(path):
+                    return origin
+        return None
+
+    def _defects_back_to_origin(self):
+        """Bis 1.0.2 zog ein Defekt-Eintrag beim Verschieben aus dem Log mit an den neuen Ort.
+        Solche Eintraege zurueck an ihren Ursprungsort holen: Liegt dort schon ein Ersatz, uebernimmt
+        dessen Eintrag den Defekt-Haken (als Ersatz zur Pruefung markiert)."""
+        roots = self.scan_roots()
+        if not roots:
+            return
+        rows = self.conn.execute("SELECT id, path, size FROM files WHERE defect=1").fetchall()
+        for fid, path, size in rows:
+            if _under_any(path, roots):
+                continue
+            origin = self._origin_of(path)
+            if origin is None:
+                continue
+            other = self.conn.execute("SELECT id, size, peaks IS NOT NULL FROM files WHERE path=?",
+                                      (origin,)).fetchone()
+            if other:
+                oid, osize, has_peaks = other
+                replaced = int(osize != size)
+                # ohne gespeicherte Wellenform beim naechsten Scan neu analysieren (zum Anhoeren/Pruefen)
+                status = "" if has_peaks else ", status='pending'"
+                self.conn.execute(f"UPDATE files SET defect=1, replaced=?, moved_to=?, reviewed=0{status} "
+                                  "WHERE id=?", (replaced, path, oid))
+                self.conn.execute("DELETE FROM markers WHERE file_id=?", (fid,))
+                self.conn.execute("DELETE FROM files WHERE id=?", (fid,))
+            else:
+                exists = os.path.exists(origin)
+                replaced = int(exists and os.path.getsize(origin) != size)
+                self.conn.execute("UPDATE files SET path=?, moved_to=?, status=?, replaced=? WHERE id=?",
+                                  (origin, path, "pending" if exists else "missing", replaced, fid))
 
     def close(self):
         with self.lock:
@@ -251,7 +328,7 @@ class Database:
             status = "suspect" if markers else "clean"
         removed_flags = [False] * len(markers)
         with self.lock:
-            cur = self.conn.execute("SELECT id, size, mtime, defect, parked FROM files WHERE path=?",
+            cur = self.conn.execute("SELECT id, size, mtime, defect, parked, status FROM files WHERE path=?",
                                     (res["path"],)).fetchone()
             # Geparkte (z. B. frisch geschnittene) Dateien behalten die Wellenform zum Anhoeren
             keep_peaks = bool(markers) or bool(cur and (cur[3] or cur[4]))
@@ -270,6 +347,10 @@ class Database:
                     old = self.conn.execute("SELECT start, end, center, removed FROM markers "
                                             "WHERE file_id=?", (file_id,)).fetchall()
                     removed_flags = [_was_removed(m, old) for m in markers]
+                elif cur[3]:
+                    # Ersatz fuer eine als defekt bestaetigte Datei: Defekt-Haken bleibt, bis der
+                    # Nutzer die neue Datei angehoert und den Haken entfernt hat
+                    keep = ", reviewed=0, replaced=1"
                 else:
                     keep = ", defect=0, reviewed=0"
                 self.conn.execute(
@@ -296,7 +377,8 @@ class Database:
         files = [FileRow(id=r[0], path=r[1], duration=r[2] or 0.0, sr=r[3] or 0, channels=r[4] or 0,
                          codec=r[5] or "", tempo=r[6] or 0.0, status=r[7], defect=bool(r[8]),
                          reviewed=bool(r[9]), peaks=None, error=r[11] or "", has_peaks=bool(r[10]),
-                         reviewed_at=r[12] or "", parked=bool(r[13]))
+                         reviewed_at=r[12] or "", parked=bool(r[13]), moved_to=r[14] or "",
+                         replaced=bool(r[15]))
                  for r in rows]
         if not files:
             return files
@@ -317,7 +399,7 @@ class Database:
 
     # Wellenformen werden nicht mitgeladen (bei grossen Archiven sonst Hunderte MB im Speicher)
     _COLS = ("id, path, duration, sr, channels, codec, tempo, status, defect, reviewed, "
-             "peaks IS NOT NULL, error, reviewed_at, parked")
+             "peaks IS NOT NULL, error, reviewed_at, parked, moved_to, replaced")
 
     @staticmethod
     def _root_clause(roots: list[str] | None) -> tuple[str, list]:
@@ -415,23 +497,12 @@ class Database:
             self.conn.executemany("UPDATE files SET status='missing' WHERE id=?", [(i,) for i in ids])
             self.conn.commit()
 
-    def relocate(self, file_id: int, new_path: str, size: int, mtime: float) -> bool:
+    def relocate(self, file_id: int, new_path: str, size: int, mtime: float):
         """Verschobene Datei: Eintrag samt Pruefstand an den neuen Ort umziehen. Der Status wird
         aus den Markern wiederhergestellt, eine Neuanalyse ist nicht noetig (Ton unveraendert).
-        Ausnahme: Eine als defekt bestaetigte Datei, deren Groesse sich geaendert hat, ist meist ein
-        neu eingelesener Ersatz -- sie erbt den Defekt nicht, sondern wird frisch analysiert.
-        Rueckgabe True = Eintrag zur Neuanalyse zurueckgesetzt."""
+        Als defekt bestaetigte Eintraege ziehen nie um, sie bleiben an ihrem Ursprungsort."""
         with self.lock:
-            old_size, defect = self.conn.execute("SELECT size, defect FROM files WHERE id=?",
-                                                 (file_id,)).fetchone()
             self.conn.execute("DELETE FROM files WHERE path=? AND id<>?", (new_path, file_id))
-            if defect and old_size != size:
-                self.conn.execute("DELETE FROM markers WHERE file_id=?", (file_id,))
-                self.conn.execute(
-                    "UPDATE files SET path=?, size=?, mtime=?, status='pending', defect=0, reviewed=0, "
-                    "peaks=NULL, error='', reviewed_at=? WHERE id=?", (new_path, size, mtime, _now(), file_id))
-                self.conn.commit()
-                return True
             has_markers = self.conn.execute("SELECT COUNT(*) FROM markers WHERE file_id=?",
                                             (file_id,)).fetchone()[0]
             err = self.conn.execute("SELECT error FROM files WHERE id=?", (file_id,)).fetchone()[0]
@@ -439,11 +510,11 @@ class Database:
             self.conn.execute("UPDATE files SET path=?, size=?, mtime=?, status=? WHERE id=?",
                               (new_path, size, mtime, status, file_id))
             self.conn.commit()
-        return False
 
     def delete_missing(self) -> int:
+        """Fehlende Eintraege entfernen -- ausser als defekt bestaetigte, die auf ihren Ersatz warten."""
         with self.lock:
-            n = self.conn.execute("DELETE FROM files WHERE status='missing'").rowcount
+            n = self.conn.execute("DELETE FROM files WHERE status='missing' AND defect=0").rowcount
             self.conn.commit()
         return n
 
@@ -458,7 +529,7 @@ class Database:
         with self.lock:
             rows = self.conn.execute(
                 f"SELECT {self._COLS} FROM files WHERE (status IN ('suspect','error') OR defect=1) "
-                f"AND status <> 'missing'{clause}",
+                f"AND (status <> 'missing' OR defect=1){clause}",
                 args).fetchall()
         return self._rows_to_files(rows)
 
@@ -474,9 +545,12 @@ class Database:
         return files[0] if files else None
 
     def defect_paths(self) -> list[str]:
+        """Pfade fuers Defekt-Log: nur vorhandene, tatsaechlich defekte Dateien -- nie ein noch
+        ungepruefter Ersatz (sonst wuerde das Log die neue, gute Datei loeschen/verschieben)."""
         with self.lock:
-            return [r[0] for r in self.conn.execute(
-                "SELECT path FROM files WHERE defect=1 ORDER BY path")]
+            rows = [r[0] for r in self.conn.execute(
+                "SELECT path FROM files WHERE defect=1 AND replaced=0 AND status<>'missing' ORDER BY path")]
+        return [p for p in rows if os.path.exists(p)]
 
     def counts(self, roots: list[str] | None = None) -> dict:
         clause, args = self._root_clause(roots)
@@ -531,9 +605,54 @@ class Database:
             self.conn.commit()
 
     def set_defect(self, file_id: int, defect: bool):
+        """Haken setzen/entfernen. Damit ist auch ein Ersatz geprueft (replaced zurueck)."""
         with self.lock:
-            self.conn.execute("UPDATE files SET defect=?, reviewed=1, reviewed_at=? WHERE id=?",
-                              (int(defect), _now(), file_id))
+            extra = "" if defect else ", moved_to=NULL"
+            self.conn.execute(f"UPDATE files SET defect=?, reviewed=1, replaced=0, reviewed_at=?{extra} "
+                              "WHERE id=?", (int(defect), _now(), file_id))
+            self.conn.commit()
+
+    def set_moved(self, path: str, target: str):
+        """Defekte Datei wurde aus dem Log verschoben oder geloescht: Der Eintrag bleibt an seinem
+        Ursprungsort (dort wird spaeter der Ersatz erwartet) und merkt sich, wohin die Datei ging."""
+        with self.lock:
+            self.conn.execute("UPDATE files SET moved_to=?, status='missing', replaced=0 WHERE path=?",
+                              (target, path))
+            self.conn.commit()
+
+    def find_replacement(self, file_id: int) -> str | None:
+        """Ersatz fuer einen fehlenden Eintrag in dessen Ordner suchen: gleicher Name (auch andere
+        Endung), sonst eine eindeutige Datei mit derselben Tracknummer am Anfang."""
+        from .decode import AUDIO_EXTENSIONS
+        row = self.conn.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
+        if not row:
+            return None
+        folder, name = os.path.split(row[0])
+        if not os.path.isdir(folder):
+            return None
+        stem = os.path.splitext(name)[0].lower()
+        audio = [f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS]
+        same = [f for f in audio if os.path.splitext(f)[0].lower() == stem]
+        if same:
+            return os.path.join(folder, same[0])
+        m = re.match(r"\s*(\d+)\s*[-._ ]", name)
+        if m:
+            nr = int(m.group(1))
+            hits = [f for f in audio
+                    if (mm := re.match(r"\s*(\d+)\s*[-._ ]", f)) and int(mm.group(1)) == nr]
+            if len(hits) == 1:
+                return os.path.join(folder, hits[0])
+        return None
+
+    def adopt_replacement(self, file_id: int, new_path: str):
+        """Gefundenen Ersatz uebernehmen: Der Defekt-Eintrag zeigt nun auf die neue Datei (Haken
+        bleibt, als Ersatz zur Pruefung markiert). Ein eigener Eintrag der neuen Datei wird
+        dabei aufgeloest. Die Analyse folgt danach (Status pending)."""
+        with self.lock:
+            self.conn.execute("DELETE FROM files WHERE path=? AND id<>?", (new_path, file_id))
+            self.conn.execute("DELETE FROM markers WHERE file_id=?", (file_id,))
+            self.conn.execute("UPDATE files SET path=?, status='pending', replaced=1, reviewed=0, size=NULL, "
+                              "mtime=NULL, peaks=NULL WHERE id=?", (new_path, file_id))
             self.conn.commit()
 
     def rename_path(self, old: str, new: str):

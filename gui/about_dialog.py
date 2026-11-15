@@ -118,6 +118,9 @@ Neukodierung, FLAC sample-genau. Danach → <b>Zur Neubewertung zurückschicken<
 Titel werden an Name und Spieldauer erkannt und behalten ihren Prüfstand.</li>
 <li>Einzelne Dateien oder Ordner lassen sich direkt ins Fenster ziehen – sie werden sofort
 analysiert.</li>
+<li>Defekte über das Log verschoben oder gelöscht? Der Eintrag bleibt an seinem Ursprungsort und der Name
+blinkt rot. Ein Klick sucht im Ordner nach dem neu eingelesenen Ersatz. Der Ersatz wird gleich analysiert und
+steht als „ERSATZ“ oben in der Defekt-Liste, bis Sie ihn angehört und das Häkchen entfernt haben.</li>
 <li>Als defekt bestätigte Titel bleiben in der Defekt-Liste, auch wenn eine verbesserte
 Erkennung dort später nichts mehr findet. Häkchen entfernen, wenn der Titel doch in Ordnung ist.</li>
 </ul>

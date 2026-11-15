@@ -56,15 +56,20 @@ class Scanner:
         """Verschobene Dateien wiedererkennen: Ein Eintrag, dessen Datei fehlt, zieht zu einer
         neu gefundenen Datei mit gleichem Namen, gleicher Dauer und Abtastrate um -- Groesse und
         Datum duerfen sich unterscheiden (z. B. nach dem Bearbeiten der Tags). Was danach noch
-        fehlt, wird als 'missing' markiert (ausgeblendet, kann spaeter noch umziehen)."""
+        fehlt, wird als 'missing' markiert (ausgeblendet, kann spaeter noch umziehen).
+        Als defekt bestaetigte Eintraege ziehen nie um: Sie bleiben an ihrem Ursprungsort, wo der
+        Ersatz erwartet wird, und bleiben als fehlend sichtbar. Rueckgabe: (umgezogen, fehlend,
+        davon fehlende Defekte)."""
         index = self.db.path_index()
         gone = self.db.find_missing()
         if not gone:
             return 0, 0, 0
         by_name: dict[str, list] = {}
-        for fid, path, dur, sr, _defect in gone:
-            by_name.setdefault(os.path.basename(path).lower(), []).append((fid, dur or 0.0, sr or 0))
-        moved = replaced = 0
+        defects = [fid for fid, _p, _d, _s, defect in gone if defect]
+        for fid, path, dur, sr, defect in gone:
+            if not defect:
+                by_name.setdefault(os.path.basename(path).lower(), []).append((fid, dur or 0.0, sr or 0))
+        moved = 0
         for path, size, mtime in files:
             if self.stop.is_set():
                 break
@@ -80,14 +85,12 @@ class Scanner:
             dur = info.frames / info.sr if info.sr and info.frames else 0.0
             hits = [c for c in cands if c[2] == info.sr and abs(c[1] - dur) <= MOVE_DURATION_TOL]
             if len(hits) == 1:  # nur eindeutige Treffer umziehen
-                if self.db.relocate(hits[0][0], path, size, mtime):
-                    replaced += 1   # ersetzter Defekt: wird unten frisch analysiert
-                else:
-                    moved += 1
+                self.db.relocate(hits[0][0], path, size, mtime)
                 cands.remove(hits[0])
+                moved += 1
         still = [fid for lst in by_name.values() for fid, _, _ in lst]
-        self.db.mark_missing(still)
-        return moved, len(still), replaced
+        self.db.mark_missing(still + defects)
+        return moved, len(still) + len(defects), len(defects)
 
     def run(self):
         self.on_status("Dateien werden gesammelt …")
@@ -104,7 +107,7 @@ class Scanner:
                 if item[0] not in seen:
                     seen.add(item[0])
                     files.append(item)
-        moved, missing, replaced = self._handle_moves(files)
+        moved, missing, missing_defects = self._handle_moves(files)
         todo = [f for f in files
                 if self.db.needs_analysis(f[0], f[1], f[2], ANALYZER_VERSION)]
         total = len(files)
@@ -112,10 +115,10 @@ class Scanner:
         extra = ""
         if moved:
             extra += f" · {moved} verschobene Dateien wiedererkannt (Prüfstand übernommen)"
-        if replaced:
-            extra += f" · {replaced} ersetzte Defekt-Dateien werden neu geprüft"
         if missing:
             extra += f" · {missing} Einträge zeigen auf fehlende Dateien"
+        if missing_defects:
+            extra += f" (davon {missing_defects} Defekte, die auf Ersatz warten)"
         self.on_status(f"{total} Audiodateien, davon {len(todo)} zu analysieren{extra}")
         self.on_progress(done, total)
         if not todo or self.stop.is_set():

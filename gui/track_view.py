@@ -12,7 +12,7 @@ import os
 import re
 
 import numpy as np
-from PySide6.QtCore import QAbstractListModel, QEvent, QModelIndex, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QAbstractListModel, QEvent, QModelIndex, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QListView, QStyle, QStyledItemDelegate, QToolTip
 
@@ -49,7 +49,10 @@ class TrackModel(QAbstractListModel):
         return row.visible_markers(self.level, self.kinds)
 
     def drawn(self, row: FileRow) -> list[MarkerRow]:
-        """Gezeichnete Marker: sichtbare, in der Ansicht 'Fehlerfrei' auch die entfernten."""
+        """Gezeichnete Marker: sichtbare, in der Ansicht 'Fehlerfrei' auch die entfernten.
+        Fehlt die Datei, gibt es nichts abzuspielen -- dann keine Marker."""
+        if row.missing:
+            return []
         if not self.show_removed:
             return self.visible(row)
         removed = [m for m in row.removed_markers if m.visible_kinds(self.level, self.kinds)]
@@ -142,12 +145,14 @@ class TrackDelegate(QStyledItemDelegate):
     remove_marker = Signal(object, object)      # FileRow, MarkerRow
     restore_marker = Signal(object, object)     # FileRow, MarkerRow
     toggle_defect = Signal(object)              # FileRow
+    missing_clicked = Signal(object)            # FileRow, Datei fehlt am Ursprungsort
 
     def __init__(self, model: TrackModel, parent=None):
         super().__init__(parent)
         self.model = model
         self._wave_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self.peak_loader = lambda file_id: None  # wird vom Hauptfenster gesetzt (DB-Zugriff)
+        self.blink_on = False   # Takt fuer blinkende Namen fehlender Dateien (setzt TrackView)
 
     def sizeHint(self, option, index):
         return QSize(400, ROW_H)
@@ -215,7 +220,7 @@ class TrackDelegate(QStyledItemDelegate):
         f = QFont(option.font)
         f.setBold(True)
         painter.setFont(f)
-        painter.setPen(pal.text().color())
+        painter.setPen(QColor(255, 90, 90) if row.missing and self.blink_on else pal.text().color())
         name = os.path.basename(row.path)
         info = self._info(row, len(self.model.visible(row)), len(row.removed_markers))
         fm_info = painter.fontMetrics()
@@ -249,7 +254,9 @@ class TrackDelegate(QStyledItemDelegate):
         path = QPainterPath()
         path.addPolygon(QPolygonF(top + bot))
         painter.setPen(Qt.NoPen)
-        if row.defect:
+        if row.missing:
+            wave_col = QColor(90, 90, 95)
+        elif row.defect and not row.replaced:
             wave_col = WAVE_COLOR_DEFECT
         else:
             vis = self.model.visible(row)
@@ -258,7 +265,30 @@ class TrackDelegate(QStyledItemDelegate):
             wave_col = wave_col.darker(WAVE_DIM)  # nur markierte Tracks leuchten hell
         painter.setBrush(wave_col)
         painter.drawPath(path)
-        if row.error and not row.has_peaks:
+        if row.missing:
+            hint = (f"Datei nicht mehr vorhanden. {row.moved_note} Klick: Eintrag löschen oder im Ordner "
+                    "nach Ersatz suchen").replace("  ", " ")
+            tw = painter.fontMetrics().horizontalAdvance(hint) + 16
+            box = QRectF(w.left() + 4, w.center().y() - 12, min(tw, w.width() - 8), 24)
+            painter.fillRect(box, QColor(20, 22, 25, 230))
+            painter.setPen(QColor(255, 120, 120))
+            painter.drawText(box.adjusted(8, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                             painter.fontMetrics().elidedText(hint, Qt.ElideMiddle, int(box.width() - 12)))
+        elif row.replaced:
+            n = len(g.markers)
+            found = "nichts gefunden" if not n else (f"{n} Fundstelle" if n == 1 else f"{n} Fundstellen")
+            if row.status == "pending":
+                hint = ("Ersatz-Datei – wird beim nächsten Scan analysiert. Klick: ab hier abspielen · "
+                        "Defekt-Häkchen entfernen, wenn sie in Ordnung ist")
+            else:
+                hint = (f"Ersatz-Datei – neu analysiert: {found}. Anhören und Defekt-Häkchen entfernen, "
+                        "wenn sie in Ordnung ist")
+            tw = painter.fontMetrics().horizontalAdvance(hint) + 16
+            box = QRectF(w.left() + 4, w.top() + 4, min(tw, w.width() - 8), 22)
+            painter.fillRect(box, QColor(20, 22, 25, 225))
+            painter.setPen(QColor(120, 200, 255))
+            painter.drawText(box.adjusted(8, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, hint)
+        elif row.error and not row.has_peaks:
             painter.setPen(QColor(240, 120, 120))
             painter.drawText(w.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, row.error)
         elif row.status == "pending":
@@ -356,6 +386,10 @@ class TrackDelegate(QStyledItemDelegate):
         parts.append(f"{n} Marker" if n != 1 else "1 Marker")
         if removed:
             parts.append(f"{removed} entfernt")
+        if row.missing:
+            parts.append("FEHLT")
+        elif row.replaced:
+            parts.append("ERSATZ")
         if row.parked:
             parts.append("Sonderliste")
         if row.reviewed_at:
@@ -380,8 +414,11 @@ class TrackDelegate(QStyledItemDelegate):
             if play.adjusted(-2, -2, 2, 2).contains(pos):
                 self.play_marker.emit(row, m)   # nur der Play-Knopf spielt in Schleife
                 return True
-        if g.wave.contains(pos):
-            self.play_at.emit(row, g.t_of(pos.x()))
+        if g.wave.contains(pos) or (row.missing and g.head.contains(pos)):
+            if row.missing:
+                self.missing_clicked.emit(row)   # nichts abzuspielen: Optionen anbieten
+            else:
+                self.play_at.emit(row, g.t_of(pos.x()))
             return True
         return False
 
@@ -406,6 +443,11 @@ class TrackDelegate(QStyledItemDelegate):
                 return True
         if g.check.adjusted(-4, -4, 4, 4).contains(pos):
             QToolTip.showText(event.globalPos(), "Als wirklich defekt bestätigen", view)
+            return True
+        if row.missing:
+            QToolTip.showText(event.globalPos(), "Datei nicht mehr vorhanden – Klick: Eintrag löschen oder "
+                              "nach Ersatz suchen" + (f"\nDefekte Datei: {row.moved_to}" if row.moved_to else ""),
+                              view)
             return True
         if g.wave.contains(pos):
             QToolTip.showText(event.globalPos(),
@@ -453,6 +495,16 @@ class TrackView(QListView):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         # Abdunkeln haengt an der ganzen Auswahl: bei jeder Aenderung alle Zeilen neu zeichnen
         self.selectionModel().selectionChanged.connect(lambda *_: self.viewport().update())
+        # Namen fehlender Dateien blinken; neu gezeichnet wird nur, wenn so eine Zeile da ist
+        self._blink = QTimer(self)
+        self._blink.setInterval(550)
+        self._blink.timeout.connect(self._blink_tick)
+        self._blink.start()
+
+    def _blink_tick(self):
+        self.delegate.blink_on = not self.delegate.blink_on
+        if any(r.missing for r in self.model_.rows):
+            self.viewport().update()
 
     def resizeEvent(self, e):
         self.delegate.clear_cache()

@@ -272,6 +272,7 @@ class MainWindow(QMainWindow):
         d.play_at.connect(self._play_at)
         d.remove_marker.connect(self._remove_marker)
         d.toggle_defect.connect(self._toggle_defect)
+        d.missing_clicked.connect(self._missing_options)
         d.restore_marker.connect(self._restore_marker)
         self.view.customContextMenuRequested.connect(self._context_menu)
 
@@ -388,14 +389,23 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Fehlende Dateien", "Alle Einträge zeigen auf vorhandene Dateien.")
             return
         n_def = sum(1 for g in gone if g[4])
-        sample = "\n".join(g[1] for g in gone[:8]) + ("\n…" if len(gone) > 8 else "")
+        plain = [g for g in gone if not g[4]]
+        if not plain:
+            QMessageBox.information(
+                self, "Fehlende Dateien",
+                f"{n_def} als defekt bestätigte Einträge warten an ihrem Ursprungsort auf einen Ersatz "
+                "(Name blinkt rot). Ein Klick auf so einen Eintrag bietet an, ihn zu löschen oder im Ordner "
+                "nach dem Ersatz zu suchen.")
+            return
+        sample = "\n".join(g[1] for g in plain[:8]) + ("\n…" if len(plain) > 8 else "")
         r = QMessageBox.question(
             self, "Fehlende Dateien",
-            f"{len(gone)} Einträge zeigen auf Dateien, die es nicht mehr gibt"
-            f"{f' (davon {n_def} als defekt bestätigt)' if n_def else ''}:\n\n{sample}\n\n"
+            f"{len(plain)} Einträge zeigen auf Dateien, die es nicht mehr gibt:\n\n{sample}\n\n"
             "Wurden sie nur verschoben, einfach den neuen Ordner scannen – sie werden dort an Name und "
-            "Spieldauer wiedererkannt und behalten ihren Prüfstand.\n\n"
-            "Ja = jetzt aus der Datenbank entfernen\nNein = behalten (ausgeblendet)")
+            "Spieldauer wiedererkannt und behalten ihren Prüfstand."
+            + (f"\n\n{n_def} als defekt bestätigte Einträge bleiben in jedem Fall stehen – sie warten auf "
+               "ihren Ersatz." if n_def else "")
+            + "\n\nJa = jetzt aus der Datenbank entfernen\nNein = behalten (ausgeblendet)")
         if r == QMessageBox.Yes:
             n = self.db.delete_missing()
             self.reload()
@@ -506,7 +516,9 @@ class MainWindow(QMainWindow):
             return False
         if flt == "all" and not visible and not row.defect and row.status != "error":
             return False
-        if kinds is not None and not visible:
+        # fehlende oder ersetzte Defekte brauchen Aufmerksamkeit, egal welche Fehlerarten gewaehlt sind
+        waiting = row.defect and (row.missing or row.replaced)
+        if kinds is not None and not visible and not waiting:
             return False
         q = self.ed_search.text().strip().lower()
         return not q or q in row.path.lower()
@@ -533,6 +545,11 @@ class MainWindow(QMainWindow):
             return sorted(rows, key=kind_key)
 
         def score_key(r):
+            # zuerst, was auf den Nutzer wartet: Ersatz anhoeren, dann fehlende Dateien
+            if r.defect and r.replaced:
+                return (-3, 0.0, r.path.lower())
+            if r.defect and r.missing:
+                return (-2, 0.0, r.path.lower())
             if r.status == "error":
                 return (-1, 0.0, r.path.lower())
             st = r.strength(lvl, kind)
@@ -841,6 +858,59 @@ class MainWindow(QMainWindow):
         self._refresh_row(row.id)
         self.statusBar().showMessage(f"Marker {fmt_time(m.start)} als Fehlalarm ausgegraut – ↺ holt ihn zurück", 5000)
 
+    def _missing_options(self, row: FileRow):
+        """Defekt-Eintrag, dessen Datei am Ursprungsort fehlt: loeschen oder Ersatz suchen."""
+        if row.moved_to and os.path.isabs(row.moved_to):
+            where = f"\n\nDie defekte Datei liegt jetzt hier:\n{row.moved_to}"
+        else:
+            where = f"\n\n{row.moved_note}" if row.moved_note else ""
+        box = QMessageBox(QMessageBox.Warning, "Datei nicht mehr vorhanden",
+                          f"Diese Datei gibt es an ihrem Ort nicht mehr:\n{row.path}{where}\n\n"
+                          "Liegt im Ordner schon ein neu eingelesener Ersatz, übernimmt dieser Eintrag ihn: "
+                          "Er wird gleich analysiert und bleibt als defekt markiert, bis Sie ihn angehört "
+                          "und das Häkchen entfernt haben.", parent=self)
+        b_search = box.addButton("Nach Ersatz im Ordner suchen", QMessageBox.AcceptRole)
+        b_delete = box.addButton("Eintrag löschen", QMessageBox.DestructiveRole)
+        box.addButton("Abbrechen", QMessageBox.RejectRole)
+        box.setDefaultButton(b_search)
+        box.exec()
+        if box.clickedButton() is b_delete:
+            self.db.delete_files([row.id])
+            self.view.model_.remove_id(row.id)
+            self._update_count()
+            self.statusBar().showMessage(f"Eintrag entfernt: {os.path.basename(row.path)}", 6000)
+            return
+        if box.clickedButton() is not b_search:
+            return
+        found = self.db.find_replacement(row.id)
+        if found is None:
+            folder = os.path.dirname(row.path)
+            if not os.path.isdir(folder):
+                QMessageBox.information(self, "Kein Ersatz", f"Den Ordner gibt es nicht mehr:\n{folder}")
+                return
+            r = QMessageBox.question(self, "Kein Ersatz gefunden",
+                                     f"Im Ordner liegt keine Datei mit gleichem Namen oder gleicher "
+                                     f"Tracknummer:\n{folder}\n\nErsatz-Datei selbst auswählen?")
+            if r != QMessageBox.Yes:
+                return
+            exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXTENSIONS))
+            found, _ = QFileDialog.getOpenFileName(self, "Ersatz-Datei wählen", folder, f"Audiodateien ({exts})")
+            if not found:
+                return
+            found = os.path.normpath(found)
+        self._adopt_replacement(row, found)
+
+    def _adopt_replacement(self, row: FileRow, path: str):
+        if self.player.file_id == row.id:
+            self.player.stop()
+        self.db.adopt_replacement(row.id, path)
+        self.view.delegate.clear_cache(row.id)
+        self.reload()
+        new = self.db.load_file(row.id)
+        if new is not None:
+            self._reanalyze_now([new])
+        self.statusBar().showMessage(f"Ersatz übernommen und wird analysiert: {os.path.basename(path)}", 8000)
+
     def _toggle_defect(self, row: FileRow):
         self.db.set_defect(row.id, not row.defect)
         self._refresh_row(row.id)
@@ -918,7 +988,9 @@ class MainWindow(QMainWindow):
     def _write_log(self):
         paths = self.db.defect_paths()
         if not paths:
-            QMessageBox.information(self, APP_NAME, "Es ist noch keine Datei als defekt bestätigt.")
+            QMessageBox.information(self, APP_NAME, "Keine vorhandene, als defekt bestätigte Datei fürs Log.\n\n"
+                                    "Ersatz-Dateien, die noch geprüft werden müssen, und fehlende Dateien "
+                                    "kommen nicht ins Log.")
             return
         default = self.last_log or str(DEFAULT_LOG_DIR / f"defekte_{_dt.date.today():%Y-%m-%d}.log")
         p, _ = QFileDialog.getSaveFileName(self, "Logdatei speichern", default,

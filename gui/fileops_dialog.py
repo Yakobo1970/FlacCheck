@@ -139,9 +139,11 @@ class FileOpsDialog(QDialog):
         fn = fileops.move_files if move else fileops.copy_files
         results = fn(paths, dest, self.chk_struct.isChecked())
         if move:
+            # Der Eintrag bleibt am Ursprungsort (dort wird der Ersatz erwartet) und merkt sich,
+            # wohin die defekte Datei ging
             for src, tgt, err in results:
                 if not err:
-                    self.db.rename_path(src, os.path.normpath(tgt))
+                    self.db.set_moved(src, os.path.normpath(tgt))
             self._rewrite_log({s: os.path.normpath(t) for s, t, e in results if not e})
         self._report("Verschieben" if move else "Kopieren", results)
         self._load()
@@ -158,7 +160,7 @@ class FileOpsDialog(QDialog):
         results = fileops.delete_files(paths, permanent=perm)
         for p, _, err in results:
             if not err:
-                self.db.remove_path(p)
+                self.db.set_moved(p, "(endgültig gelöscht)" if perm else "(Papierkorb)")
         self._rewrite_log({p: None for p, _, e in results if not e})
         self._report("Löschen", results)
         self._load()
